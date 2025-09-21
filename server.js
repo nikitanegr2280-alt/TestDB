@@ -1,203 +1,373 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const path = require('path');
-const bcrypt = require('bcryptjs');
-const session = require('express-session');
-const { v4: uuidv4 } = require('uuid');
+const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
-
-// Настройки MongoDB
-const MONGODB_URI = 'mongodb+srv://admin:password@cluster0.mongodb.net/onyxhub?retryWrites=true&w=majority';
-
-// Подключение к MongoDB
-mongoose.connect(MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-})
-.then(() => console.log('MongoDB подключена'))
-.catch(err => console.error('Ошибка подключения к MongoDB:', err));
-
-// Схемы Mongoose
-const userSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  role: { type: String, default: 'admin' },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const keySchema = new mongoose.Schema({
-  key: { type: String, required: true, unique: true },
-  userId: { type: String },
-  subscriptionType: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now },
-  expiresAt: { type: Date },
-  isActive: { type: Boolean, default: true },
-  isPermanent: { type: Boolean, default: false }
-});
-
-const User = mongoose.model('User', userSchema);
-const Key = mongoose.model('Key', keySchema);
+const PORT = process.env.PORT || 3000;
 
 // Middleware
+app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(session({
-  secret: 'your-secret-key',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 } // 24 часа
-}));
 
-// Установка движка шаблонов
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
+// MongoDB connection
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/onyxhub';
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-// Middleware для проверки аутентификации
-const requireAuth = (req, res, next) => {
-  if (req.session.user) {
-    next();
-  } else {
-    res.redirect('/login');
+// Static API key (should be stored in environment variables in production)
+const STATIC_API_KEY = process.env.API_KEY || 'onyxhub-secret-key-2024';
+
+// Subscription Schema
+const subscriptionSchema = new mongoose.Schema({
+  key: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  userId: {
+    type: Number,
+    required: true
+  },
+  username: String,
+  firstName: String,
+  lastName: String,
+  subscriptionType: {
+    type: String,
+    required: true
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  expiresAt: Date,
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  isFrozen: {
+    type: Boolean,
+    default: false
+  },
+  frozenDays: {
+    type: Number,
+    default: 0
+  },
+  lastChecked: {
+    type: Date,
+    default: Date.now
   }
+});
+
+const Subscription = mongoose.model('Subscription', subscriptionSchema);
+
+// Middleware to verify API key
+const verifyApiKey = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  if (!apiKey || apiKey !== STATIC_API_KEY) {
+    return res.status(401).json({ 
+      success: false, 
+      message: 'Invalid API key' 
+    });
+  }
+  
+  next();
 };
 
-// Маршруты
-app.get('/', requireAuth, async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = 10;
-    const skip = (page - 1) * limit;
-    
-    const keys = await Key.find()
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-    
-    const totalKeys = await Key.countDocuments();
-    const totalPages = Math.ceil(totalKeys / limit);
-    
-    res.render('index', {
-      user: req.session.user,
-      keys,
-      currentPage: page,
-      totalPages,
-      message: req.query.message
-    });
-  } catch (error) {
-    console.error('Ошибка загрузки ключей:', error);
-    res.status(500).render('index', {
-      user: req.session.user,
-      keys: [],
-      error: 'Ошибка загрузки данных'
-    });
-  }
+// Routes
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Onyx Hub API Server is running',
+    version: '1.0.0'
+  });
 });
 
-app.get('/login', (req, res) => {
-  if (req.session.user) {
-    return res.redirect('/');
-  }
-  res.render('login', { error: null });
-});
-
-app.post('/login', async (req, res) => {
+// Get all active subscriptions with key information
+app.get('/users/user/connect/:key', verifyApiKey, async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { key } = req.params;
     
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.render('login', { error: 'Неверные учетные данные' });
+    const subscription = await Subscription.findOne({ 
+      key, 
+      isActive: true 
+    });
+    
+    if (!subscription) {
+      return res.status(404).json({
+        success: false,
+        message: 'Subscription key not found or expired'
+      });
     }
     
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.render('login', { error: 'Неверные учетные данные' });
+    // Check if subscription is expired
+    if (subscription.expiresAt && subscription.expiresAt < new Date()) {
+      subscription.isActive = false;
+      await subscription.save();
+      
+      return res.status(410).json({
+        success: false,
+        message: 'Subscription key has expired'
+      });
     }
     
-    req.session.user = {
-      id: user._id,
-      username: user.username,
-      role: user.role
-    };
+    // Update last checked timestamp
+    subscription.lastChecked = new Date();
+    await subscription.save();
     
-    res.redirect('/');
+    res.json({
+      success: true,
+      data: {
+        key: subscription.key,
+        userId: subscription.userId,
+        username: subscription.username,
+        firstName: subscription.firstName,
+        lastName: subscription.lastName,
+        subscriptionType: subscription.subscriptionType,
+        createdAt: subscription.createdAt,
+        expiresAt: subscription.expiresAt,
+        isActive: subscription.isActive,
+        isFrozen: subscription.isFrozen,
+        frozenDays: subscription.frozenDays,
+        lastChecked: subscription.lastChecked
+      }
+    });
+    
   } catch (error) {
-    console.error('Ошибка входа:', error);
-    res.render('login', { error: 'Ошибка сервера' });
+    console.error('Error fetching subscription:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
   }
 });
 
-app.post('/logout', (req, res) => {
-  req.session.destroy();
-  res.redirect('/login');
-});
-
-app.post('/keys', requireAuth, async (req, res) => {
+// Create new subscription key
+app.post('/subscriptions', verifyApiKey, async (req, res) => {
   try {
-    const { subscriptionType, expiresAt, isPermanent } = req.body;
-    
-    const newKey = new Key({
-      key: uuidv4(),
+    const {
+      userId,
+      username,
+      firstName,
+      lastName,
       subscriptionType,
-      expiresAt: isPermanent ? null : new Date(expiresAt),
-      isPermanent: isPermanent === 'on'
+      key,
+      durationDays
+    } = req.body;
+    
+    if (!userId || !subscriptionType || !key) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: userId, subscriptionType, key'
+      });
+    }
+    
+    // Calculate expiration date
+    let expiresAt = null;
+    if (durationDays && durationDays > 0) {
+      expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + durationDays);
+    }
+    
+    const subscription = new Subscription({
+      key,
+      userId,
+      username,
+      firstName,
+      lastName,
+      subscriptionType,
+      expiresAt,
+      isActive: true
     });
     
-    await newKey.save();
-    res.redirect('/?message=Ключ успешно создан');
-  } catch (error) {
-    console.error('Ошибка создания ключа:', error);
-    res.redirect('/?message=Ошибка создания ключа');
-  }
-});
-
-app.delete('/keys/:id', requireAuth, async (req, res) => {
-  try {
-    await Key.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Ключ удален' });
-  } catch (error) {
-    console.error('Ошибка удаления ключа:', error);
-    res.status(500).json({ success: false, message: 'Ошибка удаления ключа' });
-  }
-});
-
-app.post('/keys/:id/toggle', requireAuth, async (req, res) => {
-  try {
-    const key = await Key.findById(req.params.id);
-    key.isActive = !key.isActive;
-    await key.save();
+    await subscription.save();
     
-    res.json({ 
-      success: true, 
-      message: `Ключ ${key.isActive ? 'активирован' : 'деактивирован'}`,
-      isActive: key.isActive 
+    res.status(201).json({
+      success: true,
+      message: 'Subscription key created successfully',
+      data: subscription
     });
+    
   } catch (error) {
-    console.error('Ошибка изменения статуса ключа:', error);
-    res.status(500).json({ success: false, message: 'Ошибка изменения статуса' });
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: 'Subscription key already exists'
+      });
+    }
+    
+    console.error('Error creating subscription:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
   }
 });
 
-// Запуск сервера
-const PORT = process.env.PORT || 3000;
+// Update subscription (freeze/unfreeze, extend, etc.)
+app.put('/subscriptions/:key', verifyApiKey, async (req, res) => {
+  try {
+    const { key } = req.params;
+    const updates = req.body;
+    
+    const subscription = await Subscription.findOne({ key });
+    
+    if (!subscription) {
+      return res.status(404).json({
+        success: false,
+        message: 'Subscription key not found'
+      });
+    }
+    
+    // Update fields
+    Object.keys(updates).forEach(field => {
+      if (field in subscription.schema.paths) {
+        subscription[field] = updates[field];
+      }
+    });
+    
+    await subscription.save();
+    
+    res.json({
+      success: true,
+      message: 'Subscription updated successfully',
+      data: subscription
+    });
+    
+  } catch (error) {
+    console.error('Error updating subscription:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Delete subscription key
+app.delete('/subscriptions/:key', verifyApiKey, async (req, res) => {
+  try {
+    const { key } = req.params;
+    
+    const result = await Subscription.findOneAndDelete({ key });
+    
+    if (!result) {
+      return res.status(404).json({
+        success: false,
+        message: 'Subscription key not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Subscription key deleted successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error deleting subscription:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Get all subscriptions (with optional filtering)
+app.get('/subscriptions', verifyApiKey, async (req, res) => {
+  try {
+    const { userId, isActive, subscriptionType } = req.query;
+    const filter = {};
+    
+    if (userId) filter.userId = parseInt(userId);
+    if (isActive !== undefined) filter.isActive = isActive === 'true';
+    if (subscriptionType) filter.subscriptionType = subscriptionType;
+    
+    const subscriptions = await Subscription.find(filter).sort({ createdAt: -1 });
+    
+    res.json({
+      success: true,
+      count: subscriptions.length,
+      data: subscriptions
+    });
+    
+  } catch (error) {
+    console.error('Error fetching subscriptions:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Cleanup expired subscriptions (can be called periodically)
+app.post('/subscriptions/cleanup', verifyApiKey, async (req, res) => {
+  try {
+    const result = await Subscription.updateMany(
+      { 
+        expiresAt: { $lt: new Date() },
+        isActive: true 
+      },
+      { 
+        isActive: false 
+      }
+    );
+    
+    res.json({
+      success: true,
+      message: `Deactivated ${result.modifiedCount} expired subscriptions`
+    });
+    
+  } catch (error) {
+    console.error('Error cleaning up subscriptions:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({
+    success: false,
+    message: 'Something went wrong!'
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Endpoint not found'
+  });
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`Сервер запущен на порту ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
 
-// Функция для удаления просроченных ключей
+// Cleanup expired subscriptions every hour
 setInterval(async () => {
   try {
-    const result = await Key.deleteMany({
-      isPermanent: false,
-      expiresAt: { $lt: new Date() }
-    });
+    const result = await Subscription.updateMany(
+      { 
+        expiresAt: { $lt: new Date() },
+        isActive: true 
+      },
+      { 
+        isActive: false 
+      }
+    );
     
-    if (result.deletedCount > 0) {
-      console.log(`Удалено ${result.deletedCount} просроченных ключей`);
+    if (result.modifiedCount > 0) {
+      console.log(`Cleaned up ${result.modifiedCount} expired subscriptions`);
     }
   } catch (error) {
-    console.error('Ошибка удаления просроченных ключей:', error);
+    console.error('Error in scheduled cleanup:', error);
   }
-}, 60 * 60 * 1000); // Каждый час
+}, 60 * 60 * 1000); // Every hour
